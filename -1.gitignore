@@ -1,0 +1,79 @@
+# ───────────────────────────────────────────────
+# FxYield Agent — .gitignore
+# ───────────────────────────────────────────────
+
+# ── CRITICAL: Never commit secrets ──────────────
+.env
+.env.local
+.env.development
+.env.production
+.env.staging
+.env.*.local
+*.pem
+*.key
+keystore/
+secrets/
+
+# ── Node.js ──────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+package-lock.json
+yarn.lock
+.npm
+
+# ── Build outputs ────────────────────────────────
+dist/
+build/
+out/
+.output/
+.nuxt/
+.next/
+*.tsbuildinfo
+
+# ── Vite / React ─────────────────────────────────
+dist-ssr/
+*.local
+
+# ── Agent runtime ────────────────────────────────
+logs/
+*.log
+agent-state.json
+cycle-history.json
+wallet-cache/
+
+# ── Testing ──────────────────────────────────────
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+
+# ── IDE & editors ────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── OS files ─────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# ── TypeScript ───────────────────────────────────
+*.js.map
+*.d.ts.map
+
+# ── Deployment ───────────────────────────────────
+.vercel
+.render
+.netlify
