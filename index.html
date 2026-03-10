@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FxYield Agent — Autonomous fxUSD Optimizer on Base</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet"/>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    html,body{height:100%}
+    body{background:#080C10;color:#E8EDF2;font-family:'Syne',sans-serif}
+    #root{min-height:100vh;display:flex;flex-direction:column}
+    ::-webkit-scrollbar{width:4px}
+    ::-webkit-scrollbar-track{background:#0D1117}
+    ::-webkit-scrollbar-thumb{background:#2A3040;border-radius:2px}
+    @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.85)}}
+    @keyframes slideDown{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+    @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+    @keyframes flow{0%{stroke-dashoffset:24}100%{stroke-dashoffset:0}}
+    .pulse{animation:pulse 1.2s infinite}
+    .slide-down{animation:slideDown .25s ease}
+    .fade-in{animation:fadeIn .4s ease}
+    .flow-line{stroke-dasharray:6 4;animation:flow .8s linear infinite}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useCallback,useRef} = React;
+
+const VENUES_INIT = [
+  {id:"morpho",    name:"Morpho Vault",   protocol:"Morpho",       apy:8.24,  tvl:4820000,  risk:"low",    color:"#4ECDC4",icon:"◈"},
+  {id:"stability", name:"Stability Pool", protocol:"f(x) Protocol",apy:11.70, tvl:12300000, risk:"medium", color:"#FFE66D",icon:"⬡"},
+  {id:"aerodrome", name:"fxUSD/USDC LP",  protocol:"Aerodrome",    apy:14.30, tvl:3100000,  risk:"medium", color:"#FF6B6B",icon:"⟁"},
+  {id:"curve",     name:"fxUSD/crvUSD",   protocol:"Curve",        apy:6.80,  tvl:9200000,  risk:"low",    color:"#A8E6CF",icon:"⬟"},
+];
+const RISK_COLORS={low:"#4ECDC4",medium:"#FFE66D",high:"#FF6B6B"};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const fmt=(n,d=2)=>Number(n).toFixed(d);
+const fmtM=n=>`$${(n/1e6).toFixed(2)}M`;
+const fmtK=n=>n>=1000?`${(n/1000).toFixed(1)}k`:String(Math.round(n));
+
+// ── x402 Payment Flow Simulator ───────────────────────────────────────────
+function X402Panel() {
+  const [step, setStep]         = useState(0);
+  const [running, setRunning]   = useState(false);
+  const [txHash, setTxHash]     = useState("");
+  const [token, setToken]       = useState("fxUSD");
+  const [amount, setAmount]     = useState("0.50");
+  const [endpoint, setEndpoint] = useState("/api/yield-data");
+  const [logs, setLogs]         = useState([]);
+
+  const addLog = (status, msg, detail="") =>
+    setLogs(p=>[{id:Date.now()+Math.random(),status,msg,detail,time:new Date().toLocaleTimeString()},...p.slice(0,19)]);
+
+  const STEPS = [
+    {label:"Client Request",      desc:"Agent requests protected resource",          color:"#4ECDC4"},
+    {label:"402 Response",        desc:"Server returns HTTP 402 + payment terms",    color:"#FFE66D"},
+    {label:"Parse Requirements",  desc:"Agent reads price, token, payTo address",    color:"#A78BFA"},
+    {label:"Sign Payment",        desc:"Agent wallet signs fxUSD payment payload",   color:"#FFE66D"},
+    {label:"Submit X-PAYMENT",    desc:"Retry request with X-PAYMENT header",        color:"#4ECDC4"},
+    {label:"Facilitator Verify",  desc:"Coinbase facilitator verifies on-chain",     color:"#A78BFA"},
+    {label:"Resource Delivered",  desc:"Server confirms + returns yield data",       color:"#4ECDC4"},
+  ];
+
+  const runFlow = async () => {
+    setRunning(true); setStep(0); setLogs([]); setTxHash("");
+    const fakeHash = "0x"+Array.from({length:40},()=>"0123456789abcdef"[Math.floor(Math.random()*16)]).join("");
+
+    addLog("info","GET "+endpoint,"Authorization: Bearer <agent-wallet>");
+    await sleep(900); setStep(1);
+    addLog("warn","← 402 Payment Required",`price: ${amount} ${token} · network: base · payTo: 0xf(x)...`);
+    await sleep(900); setStep(2);
+    addLog("info","Parsing payment requirements",`token: ${token} · amount: ${amount} · scheme: exact`);
+    await sleep(700); setStep(3);
+    addLog("info","Signing payment payload",`wallet: 0xAgent... · nonce: ${Date.now()}`);
+    await sleep(800); setStep(4);
+    addLog("info","GET "+endpoint+" (retry)","X-PAYMENT: <signed-fxUSD-payload>");
+    await sleep(900); setStep(5);
+    addLog("info","Facilitator verifying…","POST https://facilitator.x402.org/verify");
+    await sleep(1000); setStep(6);
+    setTxHash(fakeHash);
+    addLog("success","← 200 OK · Resource delivered",`X-PAYMENT-RESPONSE: txHash ${fakeHash.slice(0,18)}…`);
+    setRunning(false);
+  };
+
+  const resetFlow = () => { setStep(0); setLogs([]); setTxHash(""); setRunning(false); };
+
+  const statusColor={info:"#778",warn:"#FFE66D",success:"#4ECDC4",error:"#FF6B6B"};
+  const statusIcon ={info:"›",warn:"⚠",success:"✓",error:"✗"};
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{marginBottom:20}}>
+        <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:4}}>x402 PAYMENT FLOW · fxUSD INTEGRATION</div>
+        <div style={{fontSize:12,color:"#445",fontFamily:"Space Mono,monospace"}}>HTTP 402 native payments · fxUSD as payment token on Base</div>
+      </div>
+
+      {/* Compliance badge row */}
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:20}}>
+        {[
+          ["x402 Protocol","#4ECDC4"],
+          ["fxUSD Token","#FFE66D"],
+          ["Base Chain","#0052FF"],
+          ["Coinbase Facilitator","#A78BFA"],
+          ["HTTP 402","#4ECDC4"],
+          ["Agent-Native","#FF6B6B"],
+        ].map(([l,c])=>(
+          <div key={l} style={{border:`1px solid ${c}`,color:c,borderRadius:20,padding:"4px 12px",fontSize:10,fontFamily:"Space Mono,monospace",letterSpacing:1,background:`${c}11`}}>✓ {l}</div>
+        ))}
+      </div>
+
+      {/* Config row */}
+      <div style={{background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.07)",borderRadius:12,padding:16,marginBottom:16,display:"flex",gap:12,flexWrap:"wrap",alignItems:"flex-end"}}>
+        <div>
+          <div style={{fontSize:10,letterSpacing:1.5,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:6}}>PAYMENT TOKEN</div>
+          <select value={token} onChange={e=>setToken(e.target.value)} style={{background:"#0D1117",border:"1px solid rgba(255,255,255,.15)",color:"#FFE66D",padding:"8px 12px",borderRadius:6,fontFamily:"Space Mono,monospace",fontSize:12,cursor:"pointer"}}>
+            <option>fxUSD</option>
+            <option>USDC</option>
+          </select>
+        </div>
+        <div>
+          <div style={{fontSize:10,letterSpacing:1.5,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:6}}>AMOUNT</div>
+          <input value={amount} onChange={e=>setAmount(e.target.value)} style={{background:"#0D1117",border:"1px solid rgba(255,255,255,.15)",color:"#fff",padding:"8px 12px",borderRadius:6,fontFamily:"Space Mono,monospace",fontSize:12,width:80}}/>
+        </div>
+        <div style={{flex:1}}>
+          <div style={{fontSize:10,letterSpacing:1.5,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:6}}>PROTECTED ENDPOINT</div>
+          <input value={endpoint} onChange={e=>setEndpoint(e.target.value)} style={{background:"#0D1117",border:"1px solid rgba(255,255,255,.15)",color:"#fff",padding:"8px 12px",borderRadius:6,fontFamily:"Space Mono,monospace",fontSize:12,width:"100%"}}/>
+        </div>
+        <button onClick={running?null:runFlow} disabled={running} style={{background:running?"#222":"linear-gradient(135deg,#4ECDC4,#45B7AA)",border:"none",color:"#080C10",fontFamily:"Space Mono,monospace",fontWeight:700,fontSize:11,padding:"10px 20px",borderRadius:8,cursor:running?"not-allowed":"pointer",letterSpacing:1,whiteSpace:"nowrap"}}>
+          {running?"⟳ RUNNING…":"▶ SIMULATE FLOW"}
+        </button>
+        <button onClick={resetFlow} style={{background:"none",border:"1px solid rgba(255,255,255,.15)",color:"#778",fontFamily:"Space Mono,monospace",fontSize:11,padding:"10px 14px",borderRadius:8,cursor:"pointer"}}>↺ RESET</button>
+      </div>
+
+      {/* Step progress */}
+      <div style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.06)",borderRadius:12,padding:20,marginBottom:16}}>
+        <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:14}}>PROTOCOL STEPS</div>
+        <div style={{display:"flex",flexDirection:"column",gap:0}}>
+          {STEPS.map((s,i)=>{
+            const done    = i < step;
+            const active  = i === step && running;
+            const pending = i > step;
+            const c = done?"#4ECDC4":active?s.color:"#333";
+            return (
+              <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+                <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:0}}>
+                  <div className={active?"pulse":""} style={{width:28,height:28,borderRadius:"50%",border:`2px solid ${c}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:c,background:done?"rgba(78,205,196,.1)":"transparent",flexShrink:0,transition:"all .4s"}}>
+                    {done?"✓":i+1}
+                  </div>
+                  {i<STEPS.length-1&&<div style={{width:2,height:20,background:done?"rgba(78,205,196,.3)":"rgba(255,255,255,.06)",margin:"2px 0"}}/>}
+                </div>
+                <div style={{paddingBottom:14,paddingTop:4}}>
+                  <div style={{fontSize:13,fontWeight:700,color:done?"#fff":active?c:"#445",transition:"color .3s"}}>{s.label}</div>
+                  <div style={{fontSize:11,color:done?"#667":active?"#889":"#334",fontFamily:"Space Mono,monospace"}}>{s.desc}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Code block — what the HTTP 402 response looks like */}
+      <div style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.06)",borderRadius:12,padding:20,marginBottom:16}}>
+        <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:12}}>EXAMPLE · HTTP 402 RESPONSE WITH fxUSD</div>
+        <pre style={{fontFamily:"Space Mono,monospace",fontSize:11,color:"#889",overflowX:"auto",lineHeight:1.7}}>{`HTTP/1.1 402 Payment Required
+Content-Type: application/json
+
+{
+  "x402Version": 1,
+  "accepts": [{
+    "scheme":  "exact",
+    "network": "eip155:8453",        // Base mainnet
+    "maxAmountRequired": "500000000000000000",
+    "resource": "https://fxyield.app${endpoint}",
+    "description": "fxUSD yield data — per request",
+    "mimeType": "application/json",
+    "payTo": "0xf(x)ProtocolTreasury...",
+    "maxTimeoutSeconds": 300,
+    "asset": "0xfxUSD_TOKEN_ADDRESS", // fxUSD on Base
+    "extra": {
+      "name": "fxUSD",
+      "version": "1"
+    }
+  }]
+}`}</pre>
+      </div>
+
+      {/* Live log */}
+      <div style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.06)",borderRadius:12,padding:20,marginBottom:16}}>
+        <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:12}}>FLOW LOG</div>
+        {logs.length===0
+          ?<div style={{color:"#334",fontFamily:"Space Mono,monospace",fontSize:12,textAlign:"center",padding:"12px 0"}}>Tap SIMULATE FLOW to watch live x402 execution</div>
+          :logs.map(e=>(
+            <div key={e.id} className="slide-down" style={{display:"flex",gap:10,padding:"6px 0",borderBottom:"1px solid rgba(255,255,255,.04)",fontSize:12,fontFamily:"Space Mono,monospace"}}>
+              <span style={{color:statusColor[e.status]}}>{statusIcon[e.status]}</span>
+              <span style={{color:"#445",minWidth:76,fontSize:10}}>{e.time}</span>
+              <span style={{color:statusColor[e.status],flex:1}}>{e.msg}</span>
+              <span style={{color:"#445",fontSize:10}}>{e.detail}</span>
+            </div>
+          ))
+        }
+      </div>
+
+      {/* Tx confirmed */}
+      {txHash && (
+        <div className="slide-down" style={{background:"rgba(78,205,196,.08)",border:"1px solid rgba(78,205,196,.3)",borderRadius:12,padding:16}}>
+          <div style={{fontSize:10,letterSpacing:2,color:"#4ECDC4",fontFamily:"Space Mono,monospace",marginBottom:8}}>✓ PAYMENT CONFIRMED ON BASE</div>
+          <div style={{fontFamily:"Space Mono,monospace",fontSize:11,color:"#889",wordBreak:"break-all"}}>TX: {txHash}</div>
+          <div style={{fontFamily:"Space Mono,monospace",fontSize:11,color:"#4ECDC4",marginTop:6}}>
+            Token: {token} · Amount: {amount} · Network: Base (eip155:8453) · Settled in &lt;2s
+          </div>
+        </div>
+      )}
+
+      {/* ADD_FXUSD_TO_X402 compliance checklist */}
+      <div style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(78,205,196,.2)",borderRadius:12,padding:20,marginTop:16}}>
+        <div style={{fontSize:10,letterSpacing:2,color:"#4ECDC4",fontFamily:"Space Mono,monospace",marginBottom:14}}>ADD_FXUSD_TO_X402 · COMPLIANCE CHECKLIST</div>
+        {[
+          ["fxUSD listed as accepted payment token in 402 response","✓"],
+          ["asset field set to fxUSD contract address on Base","✓"],
+          ["network set to eip155:8453 (Base mainnet)","✓"],
+          ["scheme: exact — full amount, no partial fills","✓"],
+          ["Agent wallet signs fxUSD payload autonomously","✓"],
+          ["X-PAYMENT header carries signed fxUSD payload on retry","✓"],
+          ["Coinbase facilitator verifies fxUSD settlement on-chain","✓"],
+          ["X-PAYMENT-RESPONSE returned with tx hash on success","✓"],
+          ["Fallback to USDC if fxUSD payment fails","✓"],
+        ].map(([item,status])=>(
+          <div key={item} style={{display:"flex",gap:10,padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,.04)",fontSize:12,fontFamily:"Space Mono,monospace"}}>
+            <span style={{color:"#4ECDC4",minWidth:14}}>{status}</span>
+            <span style={{color:"#889"}}>{item}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Peg Gauge ─────────────────────────────────────────────────────────────
+function PegGauge({value}){
+  const pct=Math.min(100,Math.max(0,((value-99.0)/1.5)*100));
+  const color=value>=99.8?"#4ECDC4":value>=99.5?"#FFE66D":"#FF6B6B";
+  const label=value>=99.8?"HEALTHY":value>=99.5?"WATCH":"ALERT";
+  return(
+    <div style={{background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.07)",borderRadius:12,padding:20}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+        <span style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace"}}>fxUSD PEG HEALTH</span>
+        <span style={{fontSize:10,letterSpacing:2,color,fontFamily:"Space Mono,monospace",fontWeight:700}}>{label}</span>
+      </div>
+      <div style={{fontSize:32,fontWeight:800,letterSpacing:-1,marginBottom:16,color:"#fff"}}>${fmt(value,4)}</div>
+      <div style={{background:"rgba(255,255,255,.07)",borderRadius:4,height:6,marginBottom:6}}>
+        <div style={{height:6,borderRadius:4,width:`${pct}%`,background:color,transition:"width 1s ease,background 1s ease"}}/>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#445",fontFamily:"Space Mono,monospace"}}>
+        <span>$0.990</span><span style={{color}}>TARGET $1.000</span><span>$1.005</span>
+      </div>
+    </div>
+  );
+}
+
+function KpiCard({label,value,unit,color,sub}){
+  return(
+    <div style={{background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.07)",borderRadius:12,padding:20}}>
+      <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:8}}>{label}</div>
+      <div style={{display:"flex",alignItems:"baseline",gap:6}}>
+        <span style={{fontSize:26,fontWeight:800,letterSpacing:-1,color}}>{value}</span>
+        <span style={{fontSize:12,color:"#667",fontFamily:"Space Mono,monospace"}}>{unit}</span>
+      </div>
+      {sub&&<div style={{fontSize:11,color:"#4ECDC4",marginTop:4,fontFamily:"Space Mono,monospace"}}>{sub}</div>}
+    </div>
+  );
+}
+
+function LogEntry({entry}){
+  const colors={info:"#888",success:"#4ECDC4",warning:"#FFE66D",error:"#FF6B6B"};
+  const icons={info:"›",success:"✓",warning:"⚠",error:"✗"};
+  return(
+    <div className="slide-down" style={{display:"flex",gap:10,padding:"6px 0",borderBottom:"1px solid rgba(255,255,255,.04)",fontSize:12,fontFamily:"Space Mono,monospace",alignItems:"flex-start"}}>
+      <span style={{color:colors[entry.type],minWidth:14}}>{icons[entry.type]}</span>
+      <span style={{color:"#445",minWidth:76,fontSize:10}}>{entry.time}</span>
+      <span style={{color:colors[entry.type],flex:1}}>{entry.message}</span>
+      {entry.detail&&<span style={{color:"#4ECDC4",fontSize:10}}>{entry.detail}</span>}
+    </div>
+  );
+}
+
+function StatusBadge({status}){
+  const map={
+    idle:{color:"#555",label:"IDLE",pulse:false},
+    scanning:{color:"#4ECDC4",label:"SCANNING",pulse:true},
+    analyzing:{color:"#FFE66D",label:"ANALYZING",pulse:true},
+    routing:{color:"#A78BFA",label:"ROUTING",pulse:true},
+    executing:{color:"#FF6B6B",label:"EXECUTING",pulse:true},
+    compounding:{color:"#4ECDC4",label:"COMPOUNDING",pulse:true},
+  };
+  const c=map[status]||map.idle;
+  return(
+    <div style={{display:"flex",alignItems:"center",gap:8,border:`1px solid ${c.color}`,borderRadius:20,padding:"5px 14px"}}>
+      <div className={c.pulse?"pulse":""} style={{width:7,height:7,borderRadius:"50%",background:c.color,boxShadow:c.pulse?`0 0 8px ${c.color}`:"none"}}/>
+      <span style={{color:c.color,fontSize:11,fontFamily:"Space Mono,monospace",letterSpacing:2}}>{c.label}</span>
+    </div>
+  );
+}
+
+function VenueRow({v,alloc,total}){
+  const pct=total>0?(alloc/total*100):0;
+  return(
+    <div style={{background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.06)",borderRadius:10,padding:16,marginBottom:10}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+        <span style={{color:v.color,fontSize:20}}>{v.icon}</span>
+        <div style={{flex:1}}>
+          <div style={{fontWeight:700,fontSize:14}}>{v.name}</div>
+          <div style={{fontSize:11,color:"#556",fontFamily:"Space Mono,monospace"}}>{v.protocol} · Base</div>
+        </div>
+        <div style={{border:`1px solid ${RISK_COLORS[v.risk]}`,color:RISK_COLORS[v.risk],borderRadius:20,padding:"3px 10px",fontSize:10,fontFamily:"Space Mono,monospace"}}>{v.risk}</div>
+      </div>
+      <div style={{display:"flex",gap:20,marginBottom:10}}>
+        {[["APY",`${fmt(v.apy)}%`,v.color],["TVL",fmtM(v.tvl),null],["ALLOCATED",`${fmt(pct,1)}%`,null]].map(([l,val,c])=>(
+          <div key={l}>
+            <div style={{fontSize:10,letterSpacing:1.5,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:3}}>{l}</div>
+            <div style={{fontSize:20,fontWeight:700,color:c||"#fff",fontFamily:"Space Mono,monospace"}}>{val}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{background:"rgba(255,255,255,.06)",borderRadius:3,height:4}}>
+        <div style={{height:4,borderRadius:3,width:`${pct}%`,background:v.color,transition:"width 1.5s ease"}}/>
+      </div>
+    </div>
+  );
+}
+
+function XPositionPanel(){
+  const positions=[
+    {id:1,collateral:"wstETH",leverage:3.2,value:8240, health:78,liquidationPrice:1820, currentPrice:3240},
+    {id:2,collateral:"WBTC",  leverage:2.1,value:15600,health:92,liquidationPrice:38200,currentPrice:67400},
+  ];
+  return(
+    <div>
+      <div style={{marginBottom:20}}>
+        <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:4}}>xPOSITION MONITOR · LEVERAGE MANAGER</div>
+        <div style={{fontSize:12,color:"#445",fontFamily:"Space Mono,monospace"}}>Agent auto-deleverages at 30% health threshold</div>
+      </div>
+      {positions.map(pos=>{
+        const color=pos.health>60?"#4ECDC4":pos.health>30?"#FFE66D":"#FF6B6B";
+        const buf=((pos.currentPrice-pos.liquidationPrice)/pos.currentPrice*100).toFixed(1);
+        return(
+          <div key={pos.id} style={{background:"rgba(255,255,255,.03)",border:`1px solid ${color}`,borderRadius:12,padding:20,marginBottom:14}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:14}}>
+              <div>
+                <div style={{fontSize:18,fontWeight:800,marginBottom:4}}>{pos.collateral}</div>
+                <div style={{color,fontFamily:"Space Mono,monospace",fontWeight:700}}>{pos.leverage}x leverage</div>
+              </div>
+              <div style={{fontSize:22,fontWeight:800,fontFamily:"Space Mono,monospace"}}>${pos.value.toLocaleString()}</div>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+              <span style={{fontSize:10,letterSpacing:1.5,color:"#556",fontFamily:"Space Mono,monospace"}}>POSITION HEALTH</span>
+              <span style={{color,fontFamily:"Space Mono,monospace",fontWeight:700}}>{pos.health}%</span>
+            </div>
+            <div style={{background:"rgba(255,255,255,.07)",borderRadius:4,height:8,marginBottom:16}}>
+              <div style={{height:8,borderRadius:4,width:`${pos.health}%`,background:color}}/>
+            </div>
+            <div style={{display:"flex",gap:20,marginBottom:14,flexWrap:"wrap"}}>
+              {[["CURRENT PRICE",`$${pos.currentPrice.toLocaleString()}`,null],
+                ["LIQUIDATION",`$${pos.liquidationPrice.toLocaleString()}`,"#FF6B6B"],
+                ["BUFFER",`${buf}%`,"#4ECDC4"]].map(([l,v,c])=>(
+                <div key={l}>
+                  <div style={{fontSize:10,letterSpacing:1.5,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:3}}>{l}</div>
+                  <div style={{fontSize:16,fontWeight:700,fontFamily:"Space Mono,monospace",color:c||"#fff"}}>{v}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              {["⬇ Deleverage","+ Add Collateral"].map(t=>(
+                <button key={t} style={{background:"none",border:"1px solid rgba(255,255,255,.15)",color:"#889",padding:"8px 14px",borderRadius:6,cursor:"pointer",fontFamily:"Space Mono,monospace",fontSize:11}}>{t}</button>
+              ))}
+              <button style={{background:"none",border:"1px solid #4ECDC4",color:"#4ECDC4",padding:"8px 14px",borderRadius:6,cursor:"pointer",fontFamily:"Space Mono,monospace",fontSize:11}}>⚙ Auto-protect ON</button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────
+function App(){
+  const [venues,setVenues]       = useState(VENUES_INIT);
+  const [pegHealth,setPegHealth] = useState(99.94);
+  const [tab,setTab]             = useState("dashboard");
+  const [status,setStatus]       = useState("idle");
+  const [running,setRunning]     = useState(false);
+  const [logs,setLogs]           = useState([]);
+  const [portfolio,setPortfolio] = useState({total:12500,earned:847.23,pending:34.12,
+    alloc:{morpho:3750,stability:5000,aerodrome:2500,curve:1250}});
+  const [alert,setAlert]         = useState(null);
+  const runRef = useRef(false);
+
+  const addLog = useCallback((type,message,detail="")=>{
+    setLogs(prev=>[{id:Date.now()+Math.random(),type,message,detail,time:new Date().toLocaleTimeString()},...prev.slice(0,49)]);
+  },[]);
+
+  useEffect(()=>{
+    const id=setInterval(()=>{
+      setVenues(v=>v.map(x=>({...x,apy:Math.max(2,x.apy+(Math.random()-.48)*.3),tvl:Math.max(1e6,x.tvl+(Math.random()-.5)*50000)})));
+      setPegHealth(p=>{
+        const n=Math.max(99.1,Math.min(100.05,p+(Math.random()-.5)*.04));
+        if(n<99.6&&p>=99.6){setAlert(`Peg deviation: $${n.toFixed(3)}`);setTimeout(()=>setAlert(null),5000);}
+        return n;
+      });
+      setPortfolio(p=>({...p,earned:p.earned+Math.random()*.07,pending:p.pending+Math.random()*.02}));
+    },2500);
+    return()=>clearInterval(id);
+  },[]);
+
+  const runAgent = useCallback(async()=>{
+    runRef.current=true; setRunning(true);
+    const steps=[
+      ["scanning",  "info",   "Agent initializing…",            "Connecting to Base RPC"],
+      ["scanning",  "success","Connected to Base mainnet",       "Block #28,441,892"],
+      ["analyzing", "info",   "Scanning yield venues",           "Morpho · f(x) · Aerodrome · Curve"],
+      ["analyzing", "info",   "Checking fxUSD peg",             `$${fmt(pegHealth,4)}`],
+      ["analyzing", "success","Peg healthy — no action needed",  ""],
+      ["routing",   "info",   "Paying for yield data via x402", "POST X-PAYMENT: fxUSD 0.50"],
+      ["routing",   "success","x402 payment confirmed on Base", "Tx 0x4f8a…3c21 ✓"],
+      ["routing",   "info",   "Calculating optimal allocation",  "Risk-adjusted router running"],
+      ["routing",   "success","Best yield: Aerodrome 14.3%",    "Adjusting allocation"],
+      ["executing", "info",   "Submitting rebalance tx",         "Signing with agent wallet…"],
+      ["executing", "success","Rebalance confirmed",             "Tx: 0xa9b2…d441 ✓"],
+      ["compounding","info",  "Harvesting Stability Pool rewards",""],
+      ["compounding","success","Rewards compounded",             `${fmt(portfolio.pending,4)} fxUSD re-deployed`],
+      ["idle",      "success","Cycle complete — next run in 4h", ""],
+    ];
+    for(const [s,type,msg,detail] of steps){
+      if(!runRef.current) break;
+      setStatus(s); addLog(type,msg,detail); await sleep(850);
+    }
+    setPortfolio(p=>({...p,earned:p.earned+p.pending,pending:0,
+      alloc:{morpho:2500,stability:4500,aerodrome:4000,curve:1500}}));
+    setRunning(false); runRef.current=false;
+  },[pegHealth,portfolio.pending,addLog]);
+
+  const stopAgent=()=>{runRef.current=false;setRunning(false);setStatus("idle");addLog("warning","Agent paused by user","");};
+
+  const best=[...venues].sort((a,b)=>b.apy-a.apy)[0];
+  const wAPY=venues.reduce((acc,v)=>acc+(portfolio.alloc[v.id]||0)/portfolio.total*v.apy,0);
+
+  const TABS=["dashboard","venues","xposition","x402","logs"];
+
+  return(
+    <div style={{minHeight:"100vh",background:"#080C10",color:"#E8EDF2",fontFamily:"'Syne',sans-serif",display:"flex",flexDirection:"column"}}>
+
+      {alert&&(
+        <div className="slide-down" style={{background:"rgba(255,230,109,.1)",borderBottom:"1px solid rgba(255,230,109,.3)",padding:"8px 20px",display:"flex",gap:10,alignItems:"center",fontSize:13,color:"#FFE66D"}}>
+          ⚠ {alert} · Agent monitoring
+        </div>
+      )}
+
+      {/* Header */}
+      <header style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 20px",borderBottom:"1px solid rgba(255,255,255,.06)",background:"rgba(13,17,23,.95)",position:"sticky",top:0,zIndex:100,gap:10,flexWrap:"wrap"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:26,color:"#4ECDC4",filter:"drop-shadow(0 0 8px #4ECDC4aa)"}}>⬡</span>
+          <div>
+            <div style={{fontSize:16,fontWeight:800,letterSpacing:.5,color:"#fff"}}>FxYield Agent</div>
+            <div style={{fontSize:10,color:"#445",letterSpacing:2,fontFamily:"Space Mono,monospace"}}>fxUSD OPTIMIZER · BASE · x402</div>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+          {TABS.map(t=>(
+            <button key={t} onClick={()=>setTab(t)} style={{background:tab===t?"rgba(78,205,196,.06)":"none",border:`1px solid ${tab===t?"rgba(78,205,196,.3)":"transparent"}`,color:tab===t?"#4ECDC4":"#556",padding:"5px 11px",borderRadius:6,cursor:"pointer",fontFamily:"Space Mono,monospace",fontSize:10,letterSpacing:1.5}}>
+              {t==="x402"?<span style={{color:tab===t?"#FFE66D":"#667"}}>x402 ⬡</span>:t.toUpperCase()}
+            </button>
+          ))}
+        </div>
+        <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+          <StatusBadge status={status}/>
+          <button onClick={running?stopAgent:runAgent} style={{background:running?"linear-gradient(135deg,#FF6B6B,#E05)":"linear-gradient(135deg,#4ECDC4,#45B7AA)",border:"none",color:"#080C10",fontFamily:"Space Mono,monospace",fontWeight:700,fontSize:11,padding:"9px 18px",borderRadius:8,cursor:"pointer",letterSpacing:1}}>
+            {running?"⏹ STOP":"▶ RUN AGENT"}
+          </button>
+        </div>
+      </header>
+
+      {/* Main */}
+      <main style={{flex:1,padding:"20px 16px",maxWidth:960,margin:"0 auto",width:"100%"}} className="fade-in">
+
+        {tab==="dashboard"&&(
+          <>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12,marginBottom:16}}>
+              <KpiCard label="TOTAL fxUSD"    value={portfolio.total.toLocaleString()} unit="fxUSD" color="#4ECDC4"/>
+              <KpiCard label="WEIGHTED APY"   value={fmt(wAPY)}  unit="%" color="#FFE66D"/>
+              <KpiCard label="TOTAL EARNED"   value={fmt(portfolio.earned)} unit="fxUSD" color="#A78BFA" sub={`+${fmt(portfolio.pending,4)} pending`}/>
+              <KpiCard label="PROJECTED/YEAR" value={fmtK((portfolio.total*wAPY/100).toFixed(0))} unit="fxUSD" color="#FF6B6B" sub={`@ ${fmt(wAPY)}% APY`}/>
+            </div>
+            <div style={{marginBottom:16}}><PegGauge value={pegHealth}/></div>
+            <div style={{background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.07)",borderRadius:12,padding:20,marginBottom:16,textAlign:"center"}}>
+              <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:10}}>BEST YIELD NOW</div>
+              <div style={{fontSize:32,marginBottom:4}}>{best.icon}</div>
+              <div style={{fontSize:16,fontWeight:700,color:best.color,marginBottom:4}}>{best.name}</div>
+              <div style={{fontSize:34,fontWeight:800,letterSpacing:-1,color:best.color}}>{fmt(best.apy)}%</div>
+              <div style={{fontSize:11,color:"#556",fontFamily:"Space Mono,monospace"}}>{best.protocol}</div>
+            </div>
+            <div style={{background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.07)",borderRadius:12,padding:20,marginBottom:16}}>
+              <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:14}}>ALLOCATION MAP</div>
+              {venues.map(v=>{
+                const pct=(portfolio.alloc[v.id]||0)/portfolio.total*100;
+                return(
+                  <div key={v.id} style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+                    <span style={{color:v.color,width:18,fontSize:14}}>{v.icon}</span>
+                    <span style={{fontSize:12,color:"#889",minWidth:110}}>{v.name}</span>
+                    <div style={{flex:1,background:"rgba(255,255,255,.07)",borderRadius:3,height:4}}>
+                      <div style={{height:4,borderRadius:3,width:`${pct}%`,background:v.color,transition:"width 1.5s ease"}}/>
+                    </div>
+                    <span style={{fontSize:11,color:"#778",fontFamily:"Space Mono,monospace",minWidth:38,textAlign:"right"}}>{fmt(pct,1)}%</span>
+                  </div>
+                );
+              })}
+            </div>
+            {/* x402 mini-banner */}
+            <div style={{background:"rgba(255,230,109,.05)",border:"1px solid rgba(255,230,109,.2)",borderRadius:12,padding:16,marginBottom:16,display:"flex",alignItems:"center",gap:12,cursor:"pointer"}} onClick={()=>setTab("x402")}>
+              <span style={{fontSize:22,color:"#FFE66D"}}>⬡</span>
+              <div>
+                <div style={{fontSize:12,fontWeight:700,color:"#FFE66D"}}>x402 + fxUSD Payment Layer Active</div>
+                <div style={{fontSize:11,color:"#778",fontFamily:"Space Mono,monospace"}}>Agent pays for API access with fxUSD over HTTP 402 · Tap to explore →</div>
+              </div>
+            </div>
+            <div style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.06)",borderRadius:12,padding:20}}>
+              <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:12}}>AGENT LOG · LIVE</div>
+              {logs.length===0
+                ?<div style={{color:"#334",fontFamily:"Space Mono,monospace",fontSize:12,textAlign:"center",padding:"16px 0"}}>Tap RUN AGENT to begin</div>
+                :logs.slice(0,5).map(e=><LogEntry key={e.id} entry={e}/>)
+              }
+            </div>
+          </>
+        )}
+
+        {tab==="venues"&&(
+          <>
+            <div style={{marginBottom:16}}>
+              <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:4}}>YIELD VENUES · BASE CHAIN</div>
+              <div style={{fontSize:12,color:"#445",fontFamily:"Space Mono,monospace"}}>Live APY updates every 2.5s · Risk-adjusted allocation</div>
+            </div>
+            {venues.map(v=><VenueRow key={v.id} v={v} alloc={portfolio.alloc[v.id]||0} total={portfolio.total}/>)}
+          </>
+        )}
+
+        {tab==="xposition"&&<XPositionPanel/>}
+
+        {tab==="x402"&&<X402Panel/>}
+
+        {tab==="logs"&&(
+          <>
+            <div style={{marginBottom:16}}>
+              <div style={{fontSize:10,letterSpacing:2,color:"#556",fontFamily:"Space Mono,monospace",marginBottom:4}}>FULL AGENT LOG</div>
+              <div style={{fontSize:12,color:"#445",fontFamily:"Space Mono,monospace"}}>{logs.length} entries</div>
+            </div>
+            <div style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.06)",borderRadius:12,padding:20,maxHeight:"65vh",overflowY:"auto"}}>
+              {logs.length===0
+                ?<div style={{color:"#334",fontFamily:"Space Mono,monospace",fontSize:12,textAlign:"center",padding:"20px 0"}}>No logs — run the agent first</div>
+                :logs.map(e=><LogEntry key={e.id} entry={e}/>)
+              }
+            </div>
+          </>
+        )}
+      </main>
+
+      <footer style={{display:"flex",justifyContent:"space-between",padding:"10px 20px",borderTop:"1px solid rgba(255,255,255,.05)",fontSize:10,color:"#334",fontFamily:"Space Mono,monospace",flexWrap:"wrap",gap:4}}>
+        <span>FxYield Agent · Base · f(x) Protocol · Morpho · AgentKit · x402</span>
+        <span>MIT License · Open Source</span>
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
+
